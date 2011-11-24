@@ -29,9 +29,14 @@
 #include <linux/spi/spi.h>
 #include <linux/gpio.h>
 #include <linux/interrupt.h>
+#include <linux/workqueue.h>
+#include <asm/delay.h>	//FIXME
 
 #define SPI_SC18IS600_NAME		"i2c-sc18is600"
 #define I2C_IRQ_PIN				AT91_PIN_PA28
+
+#define SC18IS600_REGS_NUM		0x06
+#define SC18IS600_BUF_SZ		96
 
 /*  Register offsets */
 #define SC18IS600_IOCONFIG		0x00
@@ -87,7 +92,7 @@
 #define SC18IS600_CMD_WRAWR		0x03 // I2C-bus write after write
 #define SC18IS600_CMD_SPICON	0x18 // SPI configuration
 #define SC18IS600_CMD_WRREG		0x20 // Write to internal register
-#define SC18IS600_CMD_RDREG		0x20 // Read from internal register
+#define SC18IS600_CMD_RDREG		0x21 // Read from internal register
 #define SC18IS600_CMD_PWRDWN	0x30 // Power-down mode
 
 /* Bit manipulation macros */
@@ -103,20 +108,20 @@
 
 #define fill_wrblk_msg(addr, num) \
 	sc18is600_spi_msg[0] = SC18IS600_CMD_WRBLK; \
-	sc18is600_spi_msg[1] = num; \
+	sc18is600_spi_msg[1] = (num); \
 	sc18is600_spi_msg[2] = (u8)addr<<1
 	
 #define fill_rdblk_msg(addr, num) \
 	sc18is600_spi_msg[0] = SC18IS600_CMD_RDBLK; \
-	sc18is600_spi_msg[1] = num; \
+	sc18is600_spi_msg[1] = (num); \
 	sc18is600_spi_msg[2] = (u8)addr<<1|0x01
 
 #define fill_rdawr_msg(addr, numw, numr) \
 	sc18is600_spi_msg[0] = SC18IS600_CMD_RDAWR; \
-	sc18is600_spi_msg[1] = numw; \
-	sc18is600_spi_msg[2] = numr; \
+	sc18is600_spi_msg[1] = (numw); \
+	sc18is600_spi_msg[2] = (numr); \
 	sc18is600_spi_msg[3] = (u8)addr<<1; \
-	sc18is600_spi_msg[numw+4] = (u8)addr<<1|0x01;
+	sc18is600_spi_msg[numw+4] = (u8)addr<<1|0x01
 
 #define MAX_CHIPS 10
 #define SC18IS600_FUNC (I2C_FUNC_SMBUS_QUICK | I2C_FUNC_SMBUS_BYTE | \
@@ -138,8 +143,10 @@ struct sc18is600_chip {
 				   specification */
 };
 
-u8 *sc18is600_spi_msg;
+u8 *sc18is600_spi_msg, *mrx;
 struct spi_device *sc18is600_spi_dev;
+//wait_queue_head_t wait;
+//u8 last_i2cstat;
 
 static struct sc18is600_chip *sc18is600_chips;
 
@@ -152,7 +159,107 @@ void debug_spi_msg(u8 num)
 		snprintf(debug_str,	256, "%02x", sc18is600_spi_msg[0]);
 	for(i=1; i<num; i++)
 		snprintf(debug_str, 256, "%s, %02x", debug_str, sc18is600_spi_msg[i]);
-	printk(KERN_DEBUG"sc18is600_spi_msg={%s}", debug_str);
+	dev_dbg(&sc18is600_spi_dev->dev, "sc18is600_spi_msg={%s}", debug_str);
+}
+
+static s32 sc18is600_spi_msg_write(u8 len)
+{
+	s32 ret;
+	
+	debug_spi_msg(len);
+	if((ret = spi_write(sc18is600_spi_dev, sc18is600_spi_msg, len)) < 0)
+		dev_dbg(&sc18is600_spi_dev->dev, "Can't write command to device\n");
+	
+	return ret;
+}
+
+static s32 sc18is600_read_reg(u8 reg_addr)
+{
+	s32 ret;
+	struct spi_message	m;
+	struct spi_transfer t, t1;
+	
+	memset(&t, 0, sizeof(t));
+	memset(&t1, 0, sizeof(t1));
+	
+	sc18is600_spi_msg[0] = SC18IS600_CMD_RDREG;
+	sc18is600_spi_msg[1] = reg_addr;
+	sc18is600_spi_msg[2] = 0;
+	
+    t.tx_buf	= sc18is600_spi_msg;
+    t.rx_buf 	= mrx;
+    t.len		= 2;
+    t.bits_per_word = 8;
+    t.delay_usecs = 1;
+    
+    t1.tx_buf	= &sc18is600_spi_msg[2];
+    t1.rx_buf 	= &mrx[2];
+    t1.len		= 1;
+    t1.bits_per_word = 8;
+
+	spi_message_init(&m);
+    spi_message_add_tail(&t, &m);
+    spi_message_add_tail(&t1, &m);
+    
+    if((ret=spi_sync(sc18is600_spi_dev, &m))<0) {
+		dev_err(&sc18is600_spi_dev->dev, "Can't send full-duplex spi transfer: %d\n", ret);
+		return ret;
+	}
+	ret = (s32)mrx[2];
+
+	return ret;
+}
+
+static s32 sc18is600_write_reg(u8 reg_addr, u8 value)
+{
+	s32 ret;
+	
+	dev_dbg(&sc18is600_spi_dev->dev, "Write to internal reg 0x%02X value 0x%02X\n", reg_addr, value);
+	sc18is600_spi_msg[0] = SC18IS600_CMD_WRREG;
+	sc18is600_spi_msg[1] = reg_addr;
+	sc18is600_spi_msg[2] = value;
+	if((ret = sc18is600_spi_msg_write(3)) < 0)
+		return ret;
+		
+	return 0;
+}
+
+/* 
+ * Destination buffer must have enough space.
+ * Returns zero or a negative error code.
+ */
+static s32 sc18is600_read_buf(u8 *dst_buf, u8 len)
+{
+	s32 ret;
+	struct spi_message	m;
+	struct spi_transfer t, t1;
+	
+	memset(&t, 0, sizeof(t));
+	memset(&t1, 0, sizeof(t1));
+	
+	sc18is600_spi_msg[0] = SC18IS600_CMD_RDBUF;
+	
+    t.tx_buf	= sc18is600_spi_msg;
+    t.rx_buf 	= dst_buf;
+    t.len		= 1;
+    t.bits_per_word = 8;
+    t.delay_usecs = 1;
+    
+    t1.tx_buf	= sc18is600_spi_msg;
+    t1.rx_buf 	= dst_buf;
+    t1.len		= len;
+    t1.bits_per_word = 8;
+
+	spi_message_init(&m);
+    spi_message_add_tail(&t, &m);
+    spi_message_add_tail(&t1, &m);
+    
+    if((ret=spi_sync(sc18is600_spi_dev, &m))<0) {
+		dev_err(&sc18is600_spi_dev->dev, "Can't send full-duplex spi message: %d\n", ret);
+		return ret;
+	}
+
+	return 0;
 }
 
 /* Return negative errno on error. */
@@ -180,8 +287,7 @@ static s32 sc18is600_xfer(struct i2c_adapter * adap, u16 addr, unsigned short fl
 		if (read_write == I2C_SMBUS_READ)
 			sc18is600_spi_msg[2] |= 0x01;
 		dev_dbg(&adap->dev, "smbus quick - addr 0x%02x\n", addr);
-		debug_spi_msg(3);
-		ret=spi_write(sc18is600_spi_dev, sc18is600_spi_msg, 3);
+		ret = sc18is600_spi_msg_write(3);
 		
 		ret = 0;
 		break;
@@ -190,18 +296,18 @@ static s32 sc18is600_xfer(struct i2c_adapter * adap, u16 addr, unsigned short fl
 		if (read_write == I2C_SMBUS_WRITE) {
 			chip->pointer = command;
 			fill_wrblk_msg(addr, 1);
-			sc18is600_spi_msg[3] = command;
+			sc18is600_spi_msg[3] = command|0x80;
 			dev_dbg(&adap->dev, "smbus byte - addr 0x%02x, "
 					"wrote 0x%02x.\n",
 					addr, command);
-			debug_spi_msg(4);
+			ret = sc18is600_spi_msg_write(4);
 		} else {
 			data->byte = chip->words[chip->pointer++] & 0xff;
 			fill_rdblk_msg(addr, 1);
+			ret = sc18is600_spi_msg_write(3);
 			dev_dbg(&adap->dev, "smbus byte - addr 0x%02x, "
 					"read  0x%02x.\n",
 					addr, data->byte);
-			debug_spi_msg(3);
 		}
 
 		ret = 0;
@@ -210,48 +316,49 @@ static s32 sc18is600_xfer(struct i2c_adapter * adap, u16 addr, unsigned short fl
 	case I2C_SMBUS_BYTE_DATA:
 		
 		if (read_write == I2C_SMBUS_WRITE) {
-			chip->words[command] &= 0xff00;
-			chip->words[command] |= data->byte;
 			fill_wrblk_msg(addr, 2);
-			sc18is600_spi_msg[3] = command;
+			sc18is600_spi_msg[3] = command|0x80;
 			sc18is600_spi_msg[4] = data->byte;
 			dev_dbg(&adap->dev, "smbus byte data - addr 0x%02x, "
 					"wrote 0x%02x at 0x%02x.\n",
 					addr, data->byte, command);
-			debug_spi_msg(5);
+			ret = sc18is600_spi_msg_write(5);
+			//last_i2cstat = 0x00;
+			//wait_event_timeout(wait, last_i2cstat == 0xF0, 5 * HZ);
+			udelay(1000); // FIXME
 		} else {
-			data->byte = chip->words[command] & 0xff;
 			fill_rdawr_msg(addr, 1, 1);
-			sc18is600_spi_msg[4] = command;
+			sc18is600_spi_msg[4] = command|0x80;
+			ret = sc18is600_spi_msg_write(6);
+			udelay(1000); // FIXME
+			//last_i2cstat = 0x00;
+			//wait_event_timeout(wait, last_i2cstat == 0xF0, 5 * HZ);
+			ret = sc18is600_read_buf(&data->byte, 1);
 			dev_dbg(&adap->dev, "smbus byte data - addr 0x%02x, "
 					"read  0x%02x at 0x%02x.\n",
 					addr, data->byte, command);
-			debug_spi_msg(6);
 		}
-		chip->pointer = command + 1;
-
-		ret = 0;
 		break;
 
 	case I2C_SMBUS_WORD_DATA:
 		if (read_write == I2C_SMBUS_WRITE) {
 			chip->words[command] = data->word;
 			fill_wrblk_msg(addr, 3);
-			sc18is600_spi_msg[3] = command;
+			sc18is600_spi_msg[3] = command|0x80;
 			sc18is600_spi_msg[4] = (u8)(data->word&0x00FF);
 			sc18is600_spi_msg[5] = (u8)(data->word>>8);
 			dev_dbg(&adap->dev, "smbus word data - addr 0x%02x, "
 					"wrote 0x%04x at 0x%02x.\n",
 					addr, data->word, command);
-			debug_spi_msg(6);
+			ret = sc18is600_spi_msg_write(6);
 		} else {
 			data->word = chip->words[command];
 			fill_rdawr_msg(addr, 1, 2);
-			sc18is600_spi_msg[4] = command;
+			sc18is600_spi_msg[4] = command|0x80;
 			dev_dbg(&adap->dev, "smbus word data - addr 0x%02x, "
 					"read  0x%04x at 0x%02x.\n",
 					addr, data->word, command);
-			debug_spi_msg(6);
+			ret = sc18is600_spi_msg_write(6);
 		}
 
 		ret = 0;
@@ -264,14 +371,12 @@ static s32 sc18is600_xfer(struct i2c_adapter * adap, u16 addr, unsigned short fl
 			sc18is600_spi_msg[3] = command;
 			sc18is600_spi_msg[4] = len;
 			for (i = 0; i < len; i++) {
-				chip->words[command + i] &= 0xff00;
-				chip->words[command + i] |= data->block[1 + i];
 				sc18is600_spi_msg[5 + i] = data->block[1 + i];
 			}
 			dev_dbg(&adap->dev, "i2c block data - addr 0x%02x, "
 					"wrote %d bytes at 0x%02x.\n",
 					addr, len, command);
-			debug_spi_msg(len+5);
+			ret = sc18is600_spi_msg_write(len+5);
 		} else {
 			for (i = 0; i < len; i++) {
 				data->block[1 + i] =
@@ -294,18 +399,25 @@ static s32 sc18is600_xfer(struct i2c_adapter * adap, u16 addr, unsigned short fl
 	return ret;
 }
 
-
-void sc18is600_irq_process(unsigned long arg) {
-    printk(KERN_INFO "I2C_IRQ!!!\n");
-    sc18is600_spi_msg[0] = SC18IS600_CMD_RDBUF;
-    //spi_write_then_read(sc18is600_spi_dev, sc18is600_spi_msg, 1, u8 * rxbuf, unsigned n_rx);
+void sc18is600_irq_bh_handler(struct work_struct *work)
+{
+	int ret;
+	
+	if((ret = sc18is600_read_reg(SC18IS600_I2CSTAT)) < 0)
+		dev_err(&sc18is600_spi_dev->dev, "Can't read I2CStat internal register!\n");
+	dev_dbg(&sc18is600_spi_dev->dev, "I2CStat: 0x%02X!\n", (u8)ret);
+	//last_i2cstat = (u8)ret;
+	//wake_up(&wait);
 }
 
-DECLARE_TASKLET(sc18is600_irq_tasklet,sc18is600_irq_process,0);
+DECLARE_WORK(i2c_irq_bh, &sc18is600_irq_bh_handler);
 
 static irqreturn_t sc18is600_i2c_irq(int irqno, void *dev_id)
 {
-	tasklet_hi_schedule(&sc18is600_irq_tasklet);
+	if(gpio_get_value(I2C_IRQ_PIN))
+		return IRQ_HANDLED; // Faked IRQ
+	else
+		schedule_work(&i2c_irq_bh);
 	return IRQ_HANDLED;
 }
 
@@ -326,23 +438,88 @@ static struct i2c_adapter sc18is600_adapter = {
 	.name		= "sc18is600-i2c",
 };
 
+static ssize_t sc18is600_show_buf(struct device *dev,
+				struct device_attribute *attr,
+                char *buf)
+{
+	int ret;
+	int i;
+	u8 debug_str[256] = {0, };
+	
+	ret = sc18is600_read_buf(mrx, 96);
+	
+	debug_str[0] = 0;
+	for(i = 0; i < SC18IS600_BUF_SZ; i++) {
+		snprintf(debug_str,	256, "%s%02x ", debug_str, mrx[i]);
+	}
+	return scnprintf(buf, PAGE_SIZE, "%s\n", debug_str);
+}
+
+static ssize_t sc18is600_show_regs(struct device *dev,
+				struct device_attribute *attr,
+                char *buf)
+{
+	s32 ret;
+	u8 i;
+	char out_str[3+2*SC18IS600_REGS_NUM];
+	
+	snprintf(out_str, 256, "0x");
+	
+	for(i = 0; i < SC18IS600_REGS_NUM; i++) {
+		if((ret = sc18is600_read_reg(i)) < 0)
+			return (ssize_t)ret;
+		snprintf(out_str, 256, "%s%02X", out_str, (u8)ret);
+	}
+	return scnprintf(buf, PAGE_SIZE, "%s\n", out_str);
+}
+
+static ssize_t sc18is600_store_regs(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	s32 ret;
+	unsigned long tmp;
+		
+	if (strict_strtoul(buf, 16, &tmp) < 0)
+		return -EINVAL;
+	if(tmp&0xFFFF8000UL)
+		return -EINVAL;
+	
+	if((ret = sc18is600_write_reg((u8)tmp>>8, (u8)tmp&0xFF)) < 0)
+			return (ssize_t)ret;
+
+	return count;
+}
+
+static DEVICE_ATTR(buf, S_IRUSR, sc18is600_show_buf, NULL);
+static DEVICE_ATTR(regs, S_IRUSR|S_IWUSR, sc18is600_show_regs, sc18is600_store_regs);
+
+static struct attribute *sc18is600_attributes[] = {
+	&dev_attr_buf.attr,
+	&dev_attr_regs.attr,
+	NULL,
+};
+
+static const struct attribute_group sc18is600_attr_group = {
+	.attrs = sc18is600_attributes,
+};
+
 static int __devinit sc18is600_probe(struct spi_device *spi) {
 	int ret;
 	
 	spi->bits_per_word = 8;
-	spi->mode = SPI_MODE_0;
-	spi->max_speed_hz = 1200000;
+	spi->mode = SPI_MODE_3;
+	spi->max_speed_hz = 500000;
 	ret = spi_setup(spi);
 	if(ret<0)
 		return ret;
 	sc18is600_adapter.dev.parent = &spi->dev;
 	sc18is600_spi_dev = spi;
-	return 0;
-	//return sysfs_create_group(&spi->dev.kobj, &sc18is600_attr_group);
+	return sysfs_create_group(&spi->dev.kobj, &sc18is600_attr_group);
 }
 
 static int __devexit sc18is600_remove(struct spi_device *spi) {
-	//sysfs_remove_group(&spi->dev.kobj, &sc18is600_attr_group);
+	sysfs_remove_group(&spi->dev.kobj, &sc18is600_attr_group);
 	return 0;
 }
 
@@ -385,19 +562,20 @@ static int __init i2c_sc18is600_init(void)
 	/* TODO: Move all at91_* to the board file!!! */
 	at91_set_GPIO_periph(I2C_IRQ_PIN,0);
 	if(at91_set_gpio_input(I2C_IRQ_PIN, 0)) {
-		printk(KERN_DEBUG"Could not set pin %i for GPIO input.\n", I2C_IRQ_PIN);
+		dev_dbg(&sc18is600_spi_dev->dev, "Could not set pin %i for GPIO input.\n", I2C_IRQ_PIN);
 	}
 	if(at91_set_deglitch(I2C_IRQ_PIN, 1)) {
-		printk(KERN_DEBUG"Could not set pin %i for GPIO deglitch.\n", I2C_IRQ_PIN);
+		dev_dbg(&sc18is600_spi_dev->dev, "Could not set pin %i for GPIO deglitch.\n", I2C_IRQ_PIN);
 	}
 
 	/** Request IRQ for pin */
 	// |IRQF_TRIGGER_RISING
 	if(request_irq(I2C_IRQ_PIN, sc18is600_i2c_irq, IRQF_TRIGGER_NONE, "i2c-sc18is600", NULL))  {
-		printk(KERN_DEBUG"Can't register IRQ %d\n", I2C_IRQ_PIN);
+		dev_dbg(&sc18is600_spi_dev->dev, "Can't register IRQ %d\n", I2C_IRQ_PIN);
 		return -EIO;
 	}
-	
+
+	mrx=kzalloc(256 * sizeof(u8), GFP_KERNEL);
 	sc18is600_spi_msg = kzalloc(256 * sizeof(u8), GFP_KERNEL);
 	ret = spi_register_driver(&sc18is600_driver);
 	if(ret) {
@@ -415,8 +593,8 @@ static void __exit i2c_sc18is600_exit(void)
 {
 	i2c_del_adapter(&sc18is600_adapter);
 	spi_unregister_driver(&sc18is600_driver);
-	tasklet_kill(&sc18is600_irq_tasklet);
 	free_irq(I2C_IRQ_PIN,0);
+    kfree(mrx);
 	kfree(sc18is600_spi_msg);
 	kfree(sc18is600_chips);
 }
