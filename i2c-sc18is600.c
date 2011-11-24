@@ -143,10 +143,22 @@ struct sc18is600_chip {
 				   specification */
 };
 
+struct sc18is600_i2c {
+	spinlock_t			lock;
+	wait_queue_head_t	wait;
+	
+	unsigned int		irq;
+	struct device		*dev;
+	struct spi_device	*spi_dev;
+	struct i2c_adapter	adap;
+	u8 					*spi_tx_buf;
+	u8					*spi_rx_buf;
+};
+
 u8 *sc18is600_spi_msg, *mrx;
 struct spi_device *sc18is600_spi_dev;
-//wait_queue_head_t wait;
-//u8 last_i2cstat;
+wait_queue_head_t wait;
+u8 last_i2cstat;
 
 static struct sc18is600_chip *sc18is600_chips;
 
@@ -323,16 +335,16 @@ static s32 sc18is600_xfer(struct i2c_adapter * adap, u16 addr, unsigned short fl
 					"wrote 0x%02x at 0x%02x.\n",
 					addr, data->byte, command);
 			ret = sc18is600_spi_msg_write(5);
-			//last_i2cstat = 0x00;
-			//wait_event_timeout(wait, last_i2cstat == 0xF0, 5 * HZ);
-			udelay(1000); // FIXME
+			last_i2cstat = 0x00;
+			wait_event_timeout(wait, last_i2cstat == 0xF0, 5 * HZ);
+			//udelay(1000); // FIXME
 		} else {
 			fill_rdawr_msg(addr, 1, 1);
 			sc18is600_spi_msg[4] = command|0x80;
 			ret = sc18is600_spi_msg_write(6);
-			udelay(1000); // FIXME
-			//last_i2cstat = 0x00;
-			//wait_event_timeout(wait, last_i2cstat == 0xF0, 5 * HZ);
+			//udelay(1000); // FIXME
+			last_i2cstat = 0x00;
+			wait_event_timeout(wait, last_i2cstat == 0xF0, 5 * HZ);
 			ret = sc18is600_read_buf(&data->byte, 1);
 			dev_dbg(&adap->dev, "smbus byte data - addr 0x%02x, "
 					"read  0x%02x at 0x%02x.\n",
@@ -406,8 +418,8 @@ void sc18is600_irq_bh_handler(struct work_struct *work)
 	if((ret = sc18is600_read_reg(SC18IS600_I2CSTAT)) < 0)
 		dev_err(&sc18is600_spi_dev->dev, "Can't read I2CStat internal register!\n");
 	dev_dbg(&sc18is600_spi_dev->dev, "I2CStat: 0x%02X!\n", (u8)ret);
-	//last_i2cstat = (u8)ret;
-	//wake_up(&wait);
+	last_i2cstat = (u8)ret;
+	wake_up(&wait);
 }
 
 DECLARE_WORK(i2c_irq_bh, &sc18is600_irq_bh_handler);
@@ -515,6 +527,7 @@ static int __devinit sc18is600_probe(struct spi_device *spi) {
 		return ret;
 	sc18is600_adapter.dev.parent = &spi->dev;
 	sc18is600_spi_dev = spi;
+	init_waitqueue_head(&wait);
 	return sysfs_create_group(&spi->dev.kobj, &sc18is600_attr_group);
 }
 
