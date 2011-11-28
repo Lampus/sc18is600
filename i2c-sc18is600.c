@@ -349,34 +349,35 @@ static s32 sc18is600_xfer(struct i2c_adapter * adap, u16 addr, unsigned short fl
 	switch (size) {
 
 	case I2C_SMBUS_QUICK:
-		fill_wrblk_msg(addr, 0);
-		if (read_write == I2C_SMBUS_READ)
-			i2c->spi_tx_buf[2] |= 0x01;
+		if (read_write == I2C_SMBUS_WRITE) {
+			fill_wrblk_msg(addr, 0);
+		}
+		else {
+			fill_rdblk_msg(addr, 0);
+		}
 		dev_dbg(&adap->dev, "smbus quick - addr 0x%02x\n", addr);
 		ret = sc18is600_spi_msg_write(i2c, 3);
-		
-		ret = 0;
 		break;
 
 	case I2C_SMBUS_BYTE:
 		if (read_write == I2C_SMBUS_WRITE) {
-			chip->pointer = command;
 			fill_wrblk_msg(addr, 1);
 			i2c->spi_tx_buf[3] = command;
+			ret = sc18is600_spi_msg_write(i2c, 4);
 			dev_dbg(&adap->dev, "smbus byte - addr 0x%02x, "
 					"wrote 0x%02x.\n",
 					addr, command);
-			ret = sc18is600_spi_msg_write(i2c, 4);
 		} else {
 			data->byte = chip->words[chip->pointer++] & 0xff;
 			fill_rdblk_msg(addr, 1);
 			ret = sc18is600_spi_msg_write(i2c, 3);
+			if(ret < 0)
+				return ret;
+			ret = sc18is600_read_buf(i2c, &data->byte, 1);
 			dev_dbg(&adap->dev, "smbus byte - addr 0x%02x, "
 					"read  0x%02x.\n",
 					addr, data->byte);
 		}
-
-		ret = 0;
 		break;
 
 	case I2C_SMBUS_BYTE_DATA:
@@ -385,10 +386,10 @@ static s32 sc18is600_xfer(struct i2c_adapter * adap, u16 addr, unsigned short fl
 			fill_wrblk_msg(addr, 2);
 			i2c->spi_tx_buf[3] = command;
 			i2c->spi_tx_buf[4] = data->byte;
+			ret = sc18is600_spi_msg_write(i2c, 5);
 			dev_dbg(&adap->dev, "smbus byte data - addr 0x%02x, "
 					"wrote 0x%02x at 0x%02x.\n",
 					addr, data->byte, command);
-			ret = sc18is600_spi_msg_write(i2c, 5);
 		} else {
 			fill_rdawr_msg(addr, 1, 1);
 			i2c->spi_tx_buf[4] = command;
@@ -409,21 +410,20 @@ static s32 sc18is600_xfer(struct i2c_adapter * adap, u16 addr, unsigned short fl
 			i2c->spi_tx_buf[3] = command;
 			i2c->spi_tx_buf[4] = (u8)(data->word&0x00FF);
 			i2c->spi_tx_buf[5] = (u8)(data->word>>8);
+			ret = sc18is600_spi_msg_write(i2c, 6);
 			dev_dbg(&adap->dev, "smbus word data - addr 0x%02x, "
 					"wrote 0x%04x at 0x%02x.\n",
 					addr, data->word, command);
-			ret = sc18is600_spi_msg_write(i2c, 6);
 		} else {
-			data->word = chip->words[command];
 			fill_rdawr_msg(addr, 1, 2);
 			i2c->spi_tx_buf[4] = command;
-			dev_dbg(&adap->dev, "smbus word data - addr 0x%02x, "
-					"read  0x%04x at 0x%02x.\n",
-					addr, data->word, command);
 			ret = sc18is600_spi_msg_write(i2c, 6);
 			if(ret < 0)
 				return ret;
 			ret = sc18is600_read_buf(i2c, (u8 *)&data->word, 2);
+			dev_dbg(&adap->dev, "smbus word data - addr 0x%02x, "
+					"read  0x%04x at 0x%02x.\n",
+					addr, data->word, command);
 		}
 		break;
 
