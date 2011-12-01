@@ -128,20 +128,8 @@
 		   I2C_FUNC_SMBUS_BYTE_DATA | I2C_FUNC_SMBUS_WORD_DATA | \
 		   I2C_FUNC_SMBUS_BLOCK_DATA)
 
-static unsigned short chip_addr[MAX_CHIPS];
-module_param_array(chip_addr, ushort, NULL, S_IRUGO);
-MODULE_PARM_DESC(chip_addr,
-		 "Chip addresses (up to 10, between 0x03 and 0x77)");
 
 static unsigned long functionality = SC18IS600_FUNC;
-module_param(functionality, ulong, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(functionality, "Override functionality bitfield");
-
-struct sc18is600_chip {
-	u8 pointer;
-	u16 words[256];		/* Byte operations use the LSB as per SMBus
-				   specification */
-};
 
 struct sc18is600_i2c {
 	spinlock_t			lock;
@@ -154,8 +142,6 @@ struct sc18is600_i2c {
 	u8 					*spi_tx_buf;
 	u8					*spi_rx_buf;
 };
-
-static struct sc18is600_chip *sc18is600_chips;
 
 void debug_spi_msg(struct sc18is600_i2c *i2c, u8 num)
 {
@@ -331,20 +317,9 @@ static s32 sc18is600_xfer(struct i2c_adapter * adap, u16 addr, unsigned short fl
 {
 	s32 ret;
 	int i, len;
-	struct sc18is600_chip *chip = NULL;
 	struct sc18is600_i2c *i2c;
 	
 	i2c = dev_get_drvdata(adap->dev.parent);
-
-	/* Search for the right chip */
-	for (i = 0; i < MAX_CHIPS && chip_addr[i]; i++) {
-		if (addr == chip_addr[i]) {
-			chip = sc18is600_chips + i;
-			break;
-		}
-	}
-	if (!chip)
-		return -ENODEV;
 
 	switch (size) {
 
@@ -368,7 +343,7 @@ static s32 sc18is600_xfer(struct i2c_adapter * adap, u16 addr, unsigned short fl
 					"wrote 0x%02x.\n",
 					addr, command);
 		} else {
-			data->byte = chip->words[chip->pointer++] & 0xff;
+			//data->byte = chip->words[chip->pointer++] & 0xff;
 			fill_rdblk_msg(addr, 1);
 			ret = sc18is600_spi_msg_write(i2c, 3);
 			if(ret < 0)
@@ -405,7 +380,7 @@ static s32 sc18is600_xfer(struct i2c_adapter * adap, u16 addr, unsigned short fl
 
 	case I2C_SMBUS_WORD_DATA:
 		if (read_write == I2C_SMBUS_WRITE) {
-			chip->words[command] = data->word;
+			//chip->words[command] = data->word;
 			fill_wrblk_msg(addr, 3);
 			i2c->spi_tx_buf[3] = command;
 			i2c->spi_tx_buf[4] = (u8)(data->word&0x00FF);
@@ -436,14 +411,14 @@ static s32 sc18is600_xfer(struct i2c_adapter * adap, u16 addr, unsigned short fl
 			for (i = 0; i < len; i++) {
 				i2c->spi_tx_buf[5 + i] = data->block[1 + i];
 			}
+			ret = sc18is600_spi_msg_write(i2c, len+5);
 			dev_dbg(&adap->dev, "i2c block data - addr 0x%02x, "
 					"wrote %d bytes at 0x%02x.\n",
 					addr, len, command);
-			ret = sc18is600_spi_msg_write(i2c, len+5);
 		} else {
 			for (i = 0; i < len; i++) {
-				data->block[1 + i] =
-					chip->words[command + i] & 0xff;
+				//data->block[1 + i] =
+				//	chip->words[command + i] & 0xff;
 			}
 			dev_dbg(&adap->dev, "i2c block data - addr 0x%02x, "
 					"read  %d bytes at 0x%02x.\n",
@@ -658,7 +633,6 @@ static int __devexit sc18is600_remove(struct spi_device *spi) {
 	free_irq(I2C_IRQ_PIN, i2c);
     kfree(i2c->spi_rx_buf);
 	kfree(i2c->spi_tx_buf);
-	kfree(sc18is600_chips);
 	i2c_del_adapter(&i2c->adap);
 	kfree(i2c);
 	sysfs_remove_group(&spi->dev.kobj, &sc18is600_attr_group);
@@ -676,31 +650,8 @@ static struct spi_driver sc18is600_driver = {
 
 static int __init i2c_sc18is600_init(void)
 {
-	int i, ret;
+	int ret;
 
-	if (!chip_addr[0]) {
-		printk(KERN_ERR "i2c-stub: Please specify a chip address\n");
-		return -ENODEV;
-	}
-
-	for (i = 0; i < MAX_CHIPS && chip_addr[i]; i++) {
-		if (chip_addr[i] < 0x03 || chip_addr[i] > 0x77) {
-			printk(KERN_ERR "i2c-stub: Invalid chip address "
-			       "0x%02x\n", chip_addr[i]);
-			return -EINVAL;
-		}
-
-		printk(KERN_INFO "i2c-stub: Virtual chip at 0x%02x\n",
-		       chip_addr[i]);
-	}
-
-	/* Allocate memory for all chips at once */
-	sc18is600_chips = kzalloc(i * sizeof(struct sc18is600_chip), GFP_KERNEL);
-	if (!sc18is600_chips) {
-		printk(KERN_ERR "i2c-stub: Out of memory\n");
-		return -ENOMEM;
-	}
-	
 	ret = spi_register_driver(&sc18is600_driver);
 	if(ret < 0) {
 		printk(KERN_ERR "Can't register spi driver\n");
