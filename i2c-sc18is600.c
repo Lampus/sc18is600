@@ -222,7 +222,9 @@ static s32 sc18is600_check_status(struct sc18is600_i2c *i2c, u8 stat)
 			ret = -EINVAL;
 			break;
 		default:
-			BUG();
+			dev_err(i2c->dev, "Unknow I2CStat value. Something wrong!\n");
+			ret = -EINVAL;
+			//BUG();
 	}
 	return ret;
 }
@@ -239,8 +241,7 @@ static s32 sc18is600_spi_msg_write(struct sc18is600_i2c *i2c, u8 len)
 		return ret;
 	}
 		
-	switch(cmd)
-	{
+	switch(cmd) {
 		// For some commands we should wait for irq
 		case SC18IS600_CMD_WRBLK:
 		case SC18IS600_CMD_RDBLK:
@@ -281,27 +282,36 @@ static s32 sc18is600_read_buf(struct sc18is600_i2c *i2c, u8 *dst_buf, u8 len)
 {
 	s32 ret;
 	struct spi_message	m;
-	struct spi_transfer t, t1;
-	
-	memset(&t, 0, sizeof(t));
-	memset(&t1, 0, sizeof(t1));
-	
+	struct spi_transfer t, t1, t2;
+
+	spi_message_init(&m);	
+		
 	i2c->spi_tx_buf[0] = SC18IS600_CMD_RDBUF;
 	
+	memset(&t, 0, sizeof(t));
     t.tx_buf	= i2c->spi_tx_buf;
     t.rx_buf 	= dst_buf;
     t.len		= 1;
     t.bits_per_word = 8;
-    t.delay_usecs = 1;
+    t.delay_usecs = 2;
+    spi_message_add_tail(&t, &m);
     
+    memset(&t1, 0, sizeof(t1));
     t1.tx_buf	= i2c->spi_tx_buf;
     t1.rx_buf 	= dst_buf;
-    t1.len		= len;
+    t1.len		= 1;
     t1.bits_per_word = 8;
-
-	spi_message_init(&m);
-    spi_message_add_tail(&t, &m);
+    t1.delay_usecs = 2;
     spi_message_add_tail(&t1, &m);
+    
+    if(len > 1) {
+		memset(&t2, 0, sizeof(t2));
+		t2.tx_buf	= i2c->spi_tx_buf;
+		t2.rx_buf 	= &dst_buf[1];
+		t2.len		= len - 1;
+		t2.bits_per_word = 8;
+		spi_message_add_tail(&t2, &m);
+	}
     
     if((ret=spi_sync(i2c->spi_dev, &m))<0) {
 		dev_err(i2c->dev, "Can't send full-duplex spi message: %d\n", ret);
@@ -317,6 +327,7 @@ static s32 sc18is600_xfer(struct i2c_adapter * adap, u16 addr, unsigned short fl
 {
 	s32 ret;
 	int i, len;
+	u16 myword;
 	struct sc18is600_i2c *i2c;
 	
 	i2c = dev_get_drvdata(adap->dev.parent);
@@ -343,7 +354,6 @@ static s32 sc18is600_xfer(struct i2c_adapter * adap, u16 addr, unsigned short fl
 					"wrote 0x%02x.\n",
 					addr, command);
 		} else {
-			//data->byte = chip->words[chip->pointer++] & 0xff;
 			fill_rdblk_msg(addr, 1);
 			ret = sc18is600_spi_msg_write(i2c, 3);
 			if(ret < 0)
@@ -380,7 +390,6 @@ static s32 sc18is600_xfer(struct i2c_adapter * adap, u16 addr, unsigned short fl
 
 	case I2C_SMBUS_WORD_DATA:
 		if (read_write == I2C_SMBUS_WRITE) {
-			//chip->words[command] = data->word;
 			fill_wrblk_msg(addr, 3);
 			i2c->spi_tx_buf[3] = command;
 			i2c->spi_tx_buf[4] = (u8)(data->word&0x00FF);
@@ -395,7 +404,8 @@ static s32 sc18is600_xfer(struct i2c_adapter * adap, u16 addr, unsigned short fl
 			ret = sc18is600_spi_msg_write(i2c, 6);
 			if(ret < 0)
 				return ret;
-			ret = sc18is600_read_buf(i2c, (u8 *)&data->word, 2);
+			ret = sc18is600_read_buf(i2c, (u8 *)&myword, 2);
+			data->word = myword;
 			dev_dbg(&adap->dev, "smbus word data - addr 0x%02x, "
 					"read  0x%04x at 0x%02x.\n",
 					addr, data->word, command);
@@ -405,27 +415,31 @@ static s32 sc18is600_xfer(struct i2c_adapter * adap, u16 addr, unsigned short fl
 	case I2C_SMBUS_BLOCK_DATA:
 		len = data->block[0];
 		if (read_write == I2C_SMBUS_WRITE) {
-			fill_wrblk_msg(addr, len+1);
+			fill_wrblk_msg(addr, len + 2);
 			i2c->spi_tx_buf[3] = command;
 			i2c->spi_tx_buf[4] = len;
 			for (i = 0; i < len; i++) {
 				i2c->spi_tx_buf[5 + i] = data->block[1 + i];
 			}
-			ret = sc18is600_spi_msg_write(i2c, len+5);
+			ret = sc18is600_spi_msg_write(i2c, len + 5);
 			dev_dbg(&adap->dev, "i2c block data - addr 0x%02x, "
 					"wrote %d bytes at 0x%02x.\n",
 					addr, len, command);
 		} else {
-			for (i = 0; i < len; i++) {
-				//data->block[1 + i] =
-				//	chip->words[command + i] & 0xff;
-			}
+			fill_rdawr_msg(addr, 1, 32);
+			i2c->spi_tx_buf[4] = command;
+			ret = sc18is600_spi_msg_write(i2c, 6);
+			if(ret < 0)
+				return ret;
+			ret = sc18is600_read_buf(i2c, &data->block[0], 1);
+			if(ret < 0)
+				return ret;
+			len = data->block[0];
+			ret = sc18is600_read_buf(i2c, &data->block[0], len + 1);
 			dev_dbg(&adap->dev, "i2c block data - addr 0x%02x, "
 					"read  %d bytes at 0x%02x.\n",
 					addr, len, command);
 		}
-
-		ret = 0;
 		break;
 
 	default:
