@@ -294,44 +294,48 @@ static s32 sc18is600_write_reg(struct sc18is600_i2c *i2c, u8 reg_addr, u8 value)
 static s32 sc18is600_read_buf(struct sc18is600_i2c *i2c, u8 *dst_buf, u8 len)
 {
 	s32 ret;
+	u8 i;
 	struct spi_message m;
-	struct spi_transfer t, t1, t2; spi_message_init(&m);	
+	struct spi_transfer t_cmd, *t_rd;
+
+	spi_message_init(&m);	
 
 	i2c->spi_tx_buf[0] = SC18IS600_CMD_RDBUF;
+	t_rd = kzalloc(sizeof(struct spi_transfer) * len, GFP_KERNEL);
+	if (!t_rd) {
+		dev_err(i2c->dev, "Can't allocate mem for t_rd\n");
+		ret = -ENOMEM;
+		goto err_rd_buf;
+	}
 
-	memset(&t, 0, sizeof(t));
-	t.tx_buf = i2c->spi_tx_buf;
-	t.rx_buf = dst_buf;
-	t.len = 1;
-	t.bits_per_word = 8;
-	t.delay_usecs = 2;
-	spi_message_add_tail(&t, &m);
+	memset(&t_cmd, 0, sizeof(struct spi_transfer));
+	t_cmd.tx_buf = i2c->spi_tx_buf;
+	t_cmd.rx_buf = dst_buf;
+	t_cmd.len = 1;
+	t_cmd.bits_per_word = 8;
+	t_cmd.delay_usecs = 1;
+	spi_message_add_tail(&t_cmd, &m);
 
-	memset(&t1, 0, sizeof(t1));
-	t1.tx_buf = i2c->spi_tx_buf;
-	t1.rx_buf = dst_buf;
-	t1.len = 1;
-	t1.bits_per_word = 8;
-	t1.delay_usecs = 2;
-	spi_message_add_tail(&t1, &m);
-
-	if (len > 1) {
-		memset(&t2, 0, sizeof(t2));
-		t2.tx_buf = i2c->spi_tx_buf;
-		t2.rx_buf = &dst_buf[1];
-		t2.len = len - 1;
-		t2.bits_per_word = 8;
-		spi_message_add_tail(&t2, &m);
+	for (i = 0; i < len; i++) {
+		t_rd[i].tx_buf = &i2c->spi_tx_buf[i];
+		t_rd[i].rx_buf = &dst_buf[i];
+		t_rd[i].len = 1;
+		t_rd[i].bits_per_word = 8;
+		t_rd[i].delay_usecs = 1;
+		spi_message_add_tail(&t_rd[i], &m);
 	}
 
 	ret = spi_sync(i2c->spi_dev, &m);
 	if (ret < 0) {
 		dev_err(i2c->dev, "Can't send full-duplex spi message: %d\n",
 									ret);
-		return ret;
+		goto err_rd_buf;
 	}
 
-	return 0;
+	ret = 0;
+err_rd_buf:
+	kfree(t_rd);
+	return ret;
 }
 
 /* Return negative errno on error. */
@@ -510,7 +514,6 @@ static ssize_t sc18is600_show_regs(struct device *dev,
 	char out_str[3+2*SC18IS600_REGS_NUM];
 
 	i2c = dev_get_drvdata(dev);
-	printk(KERN_INFO "I2C Dev: %08X\n", i2c->irq);
 	snprintf(out_str, 256, "0x");
 
 	for (i = 0; i < SC18IS600_REGS_NUM; i++) {
@@ -544,13 +547,52 @@ static ssize_t sc18is600_store_regs(struct device *dev,
 	return count;
 }
 
+static ssize_t sc18is600_show_stat(struct device *dev,
+				struct device_attribute *attr,
+				char *buf)
+{
+	struct sc18is600_i2c *i2c;
+	s32 ret;
+	struct spi_message m;
+	struct spi_transfer t;
+
+	i2c = dev_get_drvdata(dev);
+
+	memset(&t, 0, sizeof(t));
+
+	i2c->spi_tx_buf[0] = SC18IS600_CMD_RDREG;
+	i2c->spi_tx_buf[1] = SC18IS600_I2CSTAT;
+	i2c->spi_tx_buf[2] = 0;
+
+	t.tx_buf = i2c->spi_tx_buf;
+	t.rx_buf = i2c->spi_rx_buf;
+	t.len = 3;
+	t.bits_per_word = 8;
+	t.delay_usecs = 1;
+
+	spi_message_init(&m);
+	spi_message_add_tail(&t, &m);
+	
+	ret = spi_sync(i2c->spi_dev, &m);
+	if (ret < 0) {
+		dev_err(i2c->dev, "Can't send full-duplex spi transfer: %d\n",
+									ret);
+		return ret;
+	}
+	ret = (s32)i2c->spi_rx_buf[2];
+
+	return scnprintf(buf, PAGE_SIZE, "0x%02X\n", (u8)ret);
+}
+
 static DEVICE_ATTR(buf, S_IRUSR, sc18is600_show_buf, NULL);
 static DEVICE_ATTR(regs, S_IRUSR|S_IWUSR, sc18is600_show_regs,
 							sc18is600_store_regs);
+static DEVICE_ATTR(stat, S_IRUSR, sc18is600_show_stat, NULL);
 
 static struct attribute *sc18is600_attributes[] = {
 	&dev_attr_buf.attr,
 	&dev_attr_regs.attr,
+	&dev_attr_stat.attr,
 	NULL,
 };
 
